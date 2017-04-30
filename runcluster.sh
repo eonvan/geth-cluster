@@ -34,7 +34,7 @@ echo "Contain run state `docker inspect -f {{.State.Running}} eth-node-master`"
 echo "waiting for rpc server to start"
 sleep 5
 
-enode=$(curl -X POST -d "@$basedir/admin.nodeInfo.rpc" http://localhost:8100 | jq '.result.enode' | sed -n "s/\(.*@\)\[\:\:\]\(.*\)/\1eth-node-master\2/p")
+enode=$(curl -X POST -d "@$PWD/admin.nodeInfo.rpc" http://localhost:8100 | jq '.result.enode' | sed -n "s/\(.*@\)\[\:\:\]\(.*\)/\1eth-node-master\2/p")
 
 echo "enode url is $enode"
 
