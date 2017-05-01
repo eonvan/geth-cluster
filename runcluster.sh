@@ -2,53 +2,117 @@
 
 basedir=$2
 
-echo $basedir
+mode=$3
 
-mkdir -p $basedir/master
+echo $basedir
 
 PWD="$(pwd)"
 
-makeaccount=$(geth --verbosity 1 --password $PWD/password --datadir $basedir/master --networkid 247 account new)
+master_node=0
 
-echo "$makeaccount"
+function prepareNodeDir {
+	node=$1
+	nodedir=$basedir/$node
+	if [ ! -f $nodedir ]; then
+		mkdir -p $basedir/$node
+		
+		makeaccount=$(geth --verbosity 1 --password $PWD/password --datadir $nodedir --networkid 247 account new)
 
-account=$(echo $makeaccount | sed -n 's/Address: {\([[:alnum:]]*\)}/\1/p') 
+		echo "$makeaccount"
 
-echo $account
+		account=$(echo $makeaccount | sed -n 's/Address: {\([[:alnum:]]*\)}/\1/p') 
 
-cp genesis.json.template $basedir/genesis.json
+		echo $account
 
-sed -i '' -e "s/ACCOUNT/$account/g" $basedir/genesis.json
+		echo "$account=eth-node-$node" >> $basedir/accounts.db
+		if [ ! -f $basedir/genesis.json ]; then
+			cp genesis.json.template $basedir/genesis.json
 
-geth --datadir $basedir/master --networkid 247 init $basedir/genesis.json
+			sed -i '' -e "s/ACCOUNT/$account/g" $basedir/genesis.json
+		fi
 
-docker network create geth-network
+		geth --datadir $basedir/$node --networkid 247 init $basedir/genesis.json
+	fi
+}
 
-docker run --net=geth-network -d --name eth-node-master -p 8100:8545 -p 38100:30303 -v \
-		   $basedir/master:/root/.ethereum/ \
-           ethereum/client-go --fast --cache=512 --rpc --rpcaddr 0.0.0.0 --rpcapi eth,net,web3,admin \
-           --datadir /root/.ethereum --networkid 247
+function startDocker {
+	node=$1	
+	enode=$2
+	port="3$1"
+	node_name=eth-node-$node
+	node_dir=$basedir/$node
 
-echo "Contain run state `docker inspect -f {{.State.Running}} eth-node-master`"
+	prepareNodeDir $node
+
+	if [[ -z "${enode// }" ]]; then
+		cmd="docker run --net=geth-network -d --name $node_name -p $node:8545 -p $port:30303 -v \
+		   $node_dir:/root/.ethereum/ \
+           ethereum/client-go --rpc --rpcaddr 0.0.0.0 --rpcapi eth,net,web3,personal,miner,admin \
+           --datadir /root/.ethereum --networkid 247"
+	else
+		cmd="docker run --net=geth-network -d --name $node_name -p $node:8545 -p $port:30303 -v \
+		   $node_dir:/root/.ethereum/ \
+           ethereum/client-go --rpc --rpcaddr 0.0.0.0 --rpcapi eth,net,web3,personal,miner,admin \
+           --datadir /root/.ethereum --networkid 247 --bootnodes $enode"
+	fi
+
+	echo "$cmd"
+    bash -c "$cmd"
+
+}
+
+function startNative {
+	node=$1	
+	enode=$2
+	port="3$1"
+
+	prepareNodeDir $node
+
+	node_dir=$basedir/$node
+
+	if [[ -z "${enode// }" ]]; then
+		cmd="nohup geth --rpc --rpcaddr 0.0.0.0 --rpcport $node --port $port --rpcapi eth,net,web3,personal,miner,admin \
+           --datadir $node_dir --networkid 247 > $node_dir/nohup.out 2>&1&"
+	else
+		cmd="nohup geth --rpc --rpcaddr 0.0.0.0 --rpcport $node --port $port --rpcapi eth,net,web3,personal,miner,admin \
+           --datadir $node_dir --networkid 247 --bootnodes $enode > $node_dir/nohup.out 2>&1&"
+	fi
+
+	echo "$cmd"
+
+    bash -c "$cmd"
+
+    echo "eth-node-$node starting, logs written to $node_dir/nohup.out for debugging"
+}
+
+if [[ -z "${mode// }" ]]; then
+	startNative 8100
+else
+	docker network create geth-network
+
+	startDocker 8100 
+fi
+
+if [[ ! -z "${mode// }" ]]; then
+	echo "Contain run state `docker inspect -f {{.State.Running}} eth-node-8100`"
+fi
 
 echo "waiting for rpc server to start"
-sleep 5
+sleep 10
 
-enode=$(curl -X POST -d "@$PWD/admin.nodeInfo.rpc" http://localhost:8100 | jq '.result.enode' | sed -n "s/\(.*@\)\[\:\:\]\(.*\)/\1eth-node-master\2/p")
+enode=$(curl -X POST -d "@$PWD/admin.nodeInfo.rpc" http://localhost:8100 | jq '.result.enode' | sed -n "s/\(.*@\)\[\:\:\]\(.*\)/\1eth-node-8100\2/p")
 
 echo "enode url is $enode"
 
-docker stop eth-node-master && docker rm eth-node-master
+curl -X POST --data '{"jsonrpc":"2.0","method":"miner_start","params":[],"id":1}' http://localhost:8100
 
-#Start a more secure version of master with rpc disabled
-docker run --net=geth-network -d --name eth-node-master -p 8100:8545 -p 38100:30303 -v \
-		   $basedir/master:/root/.ethereum/ \
-           ethereum/client-go  --rpc --rpcaddr 0.0.0.0 \
-           --datadir /root/.ethereum --networkid 247
+if [[ -z "${mode// }" ]]; then
+	ipaddres="127.0.0.1"
+else
+	ipaddres=$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" eth-node-8100)
+fi
 
-ipaddres=$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" eth-node-master)
-
-enode=$(echo $enode | sed -n "s/eth-node-master/$ipaddres/p")
+enode=$(echo $enode | sed -n "s/eth-node-8100/$ipaddres/p")
 
 echo "enode switched to ip $enode"
 
@@ -61,39 +125,45 @@ echo "max port is $max_port"
 
 for node in $(eval echo "{8101..$max_port}")
 do
-	echo "Creating directory $basedir/$node"
+	if [[ -z "${mode// }" ]]; then
+		startNative $node $enode
+	else
+		startDocker $node $enode 
+	fi
 
-	node_dir=$basedir/$node
-	mkdir $node_dir
+	echo "waiting for restart"
+	sleep 10
 
-	makeaccount=$(geth --verbosity 1 --password $PWD/password --datadir $node_dir --networkid 247 account new)
+	curl -X POST --data '{"jsonrpc":"2.0","method":"miner_start","params":[],"id":1}' http://localhost:$node
 
-	echo "$makeaccount"
-
-	account=$(echo $makeaccount | sed -n 's/Address: {\([[:alnum:]]*\)}/\1/p') 
-
-	echo $account
-
-	cp $basedir/genesis.json $node_dir/genesis.json
-
-	#sed -i '' -e "s/ACCOUNT/$account/g" $basedir/$node/genesis.json
-
-	geth --datadir $node_dir --networkid 247 init $node_dir/genesis.json
-
-	node_port=$((30000 +$node))
-
-	node_name="eth-node-$node"
-
-	echo "starting node $node_name on port $node_port"
-
-	cmd="docker run --net=geth-network -d --name $node_name -p $node:8545 -p $node_port:30303 -v \
-		   $node_dir:/root/.ethereum/ \
-           ethereum/client-go --fast --cache=512  --rpc --rpcaddr 0.0.0.0 \
-           --datadir /root/.ethereum --networkid 247 --bootnodes $enode"
-    
     echo "$cmd"
 
-    bash -c "$cmd"
 done
 
-docker network inspect geth-network
+#add peers
+# for node in $(eval echo "{8100..$max_port}")
+# do
+# 	for peer in $(eval echo "{$node..$max_port}")
+# 	do
+# 		if [[ $node != $peer ]]; then
+# 			enode=$(curl -X POST -d "@$PWD/admin.nodeInfo.rpc" http://localhost:$node | jq '.result.enode' | sed -n "s/\(.*@\)\[\:\:\]\(.*\)/\1eth-node-$peer\2/p")
+
+# 			echo "enode url is $enode"
+
+# 			if [[ -z "${mode// }" ]]; then
+# 				ipaddres="127.0.0.1"
+# 			else
+# 				ipaddres=$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" eth-node-$peer)
+# 			fi
+
+# 			enode=$(echo $enode | sed -n "s/eth-node-$peer/$ipaddres/p")
+
+# 			echo "enode switched to ip $enode"
+
+# 			echo "Adding peer eth-node-$peer to eth-node-$node"
+
+# 			curl -X POST --data "{\"jsonrpc\":\"2.0\",\"method\":\"admin_addPeer\",\"params\":[$enode],\"id\":1}" http://localhost:$node
+
+# 		fi
+# 	done
+# done
